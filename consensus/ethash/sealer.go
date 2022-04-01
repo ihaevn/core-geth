@@ -34,6 +34,7 @@ import (
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/rlp"
 	exprand "golang.org/x/exp/rand"
 	"gonum.org/v1/gonum/stat/distuv"
 )
@@ -240,7 +241,7 @@ type remoteSealer struct {
 	works        map[common.Hash]*types.Block
 	rates        map[common.Hash]hashrate
 	currentBlock *types.Block
-	currentWork  [4]string
+	currentWork  [10]string
 	notifyCtx    context.Context
 	cancelNotify context.CancelFunc // cancels all notification requests
 	reqWG        sync.WaitGroup     // tracks notification request goroutines
@@ -285,7 +286,7 @@ type hashrate struct {
 // sealWork wraps a seal work package for remote sealer.
 type sealWork struct {
 	errc chan error
-	res  chan [4]string
+	res  chan [10]string
 }
 
 func startRemoteSealer(ethash *Ethash, urls []string, noverify bool) *remoteSealer {
@@ -390,7 +391,9 @@ func (s *remoteSealer) loop() {
 //   result[2], 32 bytes hex encoded boundary condition ("target"), 2^256/difficulty
 //   result[3], hex encoded block number
 func (s *remoteSealer) makeWork(block *types.Block) {
-	hash := s.ethash.SealHash(block.Header())
+	header := block.Header()
+	hash := s.ethash.SealHash(header)
+
 	epochLength := calcEpochLength(block.NumberU64(), s.ethash.config.ECIP1099Block)
 	epoch := calcEpoch(block.NumberU64(), epochLength)
 	s.currentWork[0] = hash.Hex()
@@ -398,6 +401,37 @@ func (s *remoteSealer) makeWork(block *types.Block) {
 	s.currentWork[2] = common.BytesToHash(new(big.Int).Div(two256, block.Difficulty()).Bytes()).Hex()
 	s.currentWork[3] = hexutil.EncodeBig(block.Number())
 
+	s.currentWork[4] = block.ParentHash().Hex()
+	s.currentWork[5] = hexutil.EncodeUint64(block.GasLimit())
+	s.currentWork[6] = hexutil.EncodeUint64(block.GasUsed())
+	s.currentWork[7] = hexutil.EncodeUint64(uint64(len(block.Transactions())))
+	s.currentWork[8] = hexutil.EncodeUint64(uint64(len(block.Uncles())))
+
+	extra := append(header.Extra, make([]byte, 4)...)
+
+	enc := []interface{}{
+		header.ParentHash,
+		header.UncleHash,
+		header.Coinbase,
+		header.Root,
+		header.TxHash,
+		header.ReceiptHash,
+		header.Bloom,
+		header.Difficulty,
+		header.Number,
+		header.GasLimit,
+		header.GasUsed,
+		header.Time,
+		extra,
+	}
+	if header.BaseFee != nil {
+		enc = append(enc, header.BaseFee)
+	}
+
+	encoded, err := rlp.EncodeToBytes(enc)
+	if err == nil {
+		s.currentWork[9] = hexutil.Encode(encoded)
+	}
 	// Trace the seal work fetched by remote sealer.
 	s.currentBlock = block
 	s.works[hash] = block
@@ -407,6 +441,9 @@ func (s *remoteSealer) makeWork(block *types.Block) {
 // new work to be processed.
 func (s *remoteSealer) notifyWork() {
 	work := s.currentWork
+
+	//Notify work to subscriber
+	s.ethash.workFeed.Send(work)
 
 	// Encode the JSON payload of the notification. When NotifyFull is set,
 	// this is the complete block header, otherwise it is a JSON array.
@@ -423,7 +460,7 @@ func (s *remoteSealer) notifyWork() {
 	}
 }
 
-func (s *remoteSealer) sendNotification(ctx context.Context, url string, json []byte, work [4]string) {
+func (s *remoteSealer) sendNotification(ctx context.Context, url string, json []byte, work [10]string) {
 	defer s.reqWG.Done()
 
 	req, err := http.NewRequest("POST", url, bytes.NewReader(json))
