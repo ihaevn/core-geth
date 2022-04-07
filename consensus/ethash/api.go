@@ -92,6 +92,15 @@ func (api *API) NewWorks(ctx context.Context) (*rpc.Subscription, error) {
 	return rpcSub, nil
 }
 
+func (api *API) SubmitWorkByRlp(rlp string) (result string) {
+	select {
+	case api.ethash.remote.rlpString <- &rlp:
+		return "rlp is writen to chanel"
+	case <-api.ethash.remote.exitCh:
+		return "remote is exit"
+	}
+}
+
 // SubmitWork can be used by external miner to submit their POW solution.
 // It returns an indication if the work was accepted.
 // Note either an invalid solution, a stale work a non-existent work will return false.

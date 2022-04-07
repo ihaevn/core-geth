@@ -254,6 +254,7 @@ type remoteSealer struct {
 	workCh       chan *sealTask   // Notification channel to push new work and relative result channel to remote sealer
 	fetchWorkCh  chan *sealWork   // Channel used for remote sealer to fetch mining work
 	submitWorkCh chan *mineResult // Channel used for remote sealer to submit their mining result
+	rlpString    chan *string
 	fetchRateCh  chan chan uint64 // Channel used to gather submitted hash rate for local or remote sealer.
 	submitRateCh chan *hashrate   // Channel used for remote sealer to submit their mining hashrate
 	requestExit  chan struct{}
@@ -325,6 +326,9 @@ func (s *remoteSealer) loop() {
 
 	for {
 		select {
+		case rlp := <-s.rlpString:
+			s.ethash.remote.submitWorkByRlp(rlp)
+
 		case work := <-s.workCh:
 			// Update current work with new received block.
 			// Note same work can be past twice, happens when changing CPU threads.
@@ -483,8 +487,8 @@ func (s *remoteSealer) sendNotification(ctx context.Context, url string, json []
 	}
 }
 
-func (s *remoteSealer) submitWorkByRlp(headerString string) bool {
-	headerRlp, _ := hex.DecodeString(headerString)
+func (s *remoteSealer) submitWorkByRlp(headerString *string) bool {
+	headerRlp, _ := hex.DecodeString(*headerString)
 	var header *types.Header
 	rlp.DecodeBytes([]byte(headerRlp), &header)
 
