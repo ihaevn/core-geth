@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	crand "crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"math"
@@ -480,6 +481,50 @@ func (s *remoteSealer) sendNotification(ctx context.Context, url string, json []
 		s.ethash.config.Log.Trace("Notified remote miner", "miner", url, "hash", work[0], "target", work[2])
 		resp.Body.Close()
 	}
+}
+
+func (s *remoteSealer) submitWorkByRlp(headerString string) bool {
+	headerRlp, _ := hex.DecodeString(headerString)
+	var header *types.Header
+	rlp.DecodeBytes([]byte(headerRlp), &header)
+
+	// Verify the correctness of submitted result.
+	// header := block.Header()
+	// header.Nonce = nonce
+	// header.MixDigest = mixDigest
+
+	// start := time.Now()
+	if !s.noverify {
+		if err := s.ethash.verifySeal(nil, header, true); err != nil {
+			// s.ethash.config.Log.Warn("Invalid proof-of-work submitted", "sealhash", sealhash, "elapsed", common.PrettyDuration(time.Since(start)), "err", err)
+			return false
+		}
+	}
+	// Make sure the result channel is assigned.
+	if s.results == nil {
+		s.ethash.config.Log.Warn("Ethash result channel is empty, submitted mining result is rejected")
+		return false
+	}
+	// s.ethash.config.Log.Trace("Verified correct proof-of-work", "sealhash", sealhash, "elapsed", common.PrettyDuration(time.Since(start)))
+
+	// Solutions seems to be valid, return to the miner and notify acceptance.
+	block := types.Block{}
+	solution := block.WithSeal(header)
+
+	// The submitted solution is within the scope of acceptance.
+	if solution.NumberU64()+staleThreshold > s.currentBlock.NumberU64() {
+		select {
+		case s.results <- solution:
+			// s.ethash.config.Log.Debug("Work submitted is acceptable", "number", solution.NumberU64(), "sealhash", sealhash, "hash", solution.Hash())
+			return true
+		default:
+			// s.ethash.config.Log.Warn("Sealing result is not read by miner", "mode", "remote", "sealhash", sealhash)
+			return false
+		}
+	}
+	// The submitted block is too old to accept, drop it.
+	// s.ethash.config.Log.Warn("Work submitted is too old", "number", solution.NumberU64(), "sealhash", sealhash, "hash", solution.Hash())
+	return false
 }
 
 // submitWork verifies the submitted pow solution, returning
