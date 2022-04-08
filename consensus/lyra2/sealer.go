@@ -34,13 +34,13 @@ var (
 
 // Seal implements consensus.Engine, attempting to find a nonce that satisfies
 // the block's difficulty requirements.
-func (lyra2 *Lyra2) Seal(chain consensus.ChainHeaderReader, block *types.Block, results chan<- *types.Block, stop <-chan struct{}) error {
+func (lyra2 *Lyra2) Seal(chain consensus.ChainHeaderReader, block *types.Block, results chan<- types.SealResult, stop <-chan struct{}) error {
 	// If we're running a fake PoW, simply return a 0 nonce immediately
 	if lyra2.fakeMode {
 		header := block.Header()
 		header.Nonce, header.MixDigest = types.BlockNonce{}, common.Hash{}
 		select {
-		case results <- block.WithSeal(header):
+		case results <- types.SealResult{Block: block.WithSeal(header)}:
 		default:
 			lyra2.log.Warn("Sealing result is not read by miner", "mode", "fake", "sealhash", lyra2.SealHash(block.Header()))
 		}
@@ -91,7 +91,7 @@ func (lyra2 *Lyra2) Seal(chain consensus.ChainHeaderReader, block *types.Block, 
 		case result = <-locals:
 			// One of the threads found a block, abort all others
 			select {
-			case results <- result:
+			case results <- types.SealResult{Block: result}:
 			default:
 				lyra2.log.Warn("Sealing result is not read by miner", "mode", "local", "sealhash", lyra2.SealHash(block.Header()))
 			}
@@ -207,7 +207,7 @@ type remoteSealer struct {
 	lyra2        *Lyra2
 	noverify     bool
 	notifyURLs   []string
-	results      chan<- *types.Block
+	results      chan<- types.SealResult
 	workCh       chan *sealTask   // Notification channel to push new work and relative result channel to remote sealer
 	fetchWorkCh  chan *sealWork   // Channel used for remote sealer to fetch mining work
 	submitWorkCh chan *mineResult // Channel used for remote sealer to submit their mining result
@@ -220,7 +220,7 @@ type remoteSealer struct {
 // sealTask wraps a seal block with relative result channel for remote sealer thread.
 type sealTask struct {
 	block   *types.Block
-	results chan<- *types.Block
+	results chan<- types.SealResult
 }
 
 // mineResult wraps the pow solution parameters for the specified block.
@@ -429,11 +429,15 @@ func (s *remoteSealer) submitWork(nonce types.BlockNonce, mixDigest common.Hash,
 
 	// Solutions seems to be valid, return to the miner and notify acceptance.
 	solution := block.WithSeal(header)
+	result := types.SealResult{
+		Block:    solution,
+		SealHash: &sealhash,
+	}
 
 	// The submitted solution is within the scope of acceptance.
 	if solution.NumberU64()+staleThreshold > s.currentBlock.NumberU64() {
 		select {
-		case s.results <- solution:
+		case s.results <- result:
 			s.lyra2.log.Debug("Work submitted is acceptable", "number", solution.NumberU64(), "sealhash", sealhash, "hash", solution.Hash())
 			return true
 		default:

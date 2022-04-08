@@ -18,11 +18,13 @@ package ethash
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/rpc"
 )
 
@@ -92,10 +94,21 @@ func (api *API) NewWorks(ctx context.Context) (*rpc.Subscription, error) {
 	return rpcSub, nil
 }
 
-func (api *API) SubmitWorkByRlp(rlp string) (result string) {
+func (api *API) SubmitWorkByRlp(rlpCode string, nonce types.BlockNonce, digest common.Hash, sealHash common.Hash) (result string) {
+
+	headerRlp, _ := hex.DecodeString(rlpCode)
+
+	var header types.Header
+	rlp.DecodeBytes(headerRlp, &header)
+	header.Nonce = nonce
+	header.MixDigest = digest
+
 	select {
-	case api.ethash.remote.rlpString <- &rlp:
-		return "rlp is writen to chanel"
+	case api.ethash.remote.submitBlockCh <- &submitBlockData{
+		Header:   header,
+		SealHash: sealHash,
+	}:
+		return "header is writen to chanel"
 	case <-api.ethash.remote.exitCh:
 		return "remote is exit"
 	}

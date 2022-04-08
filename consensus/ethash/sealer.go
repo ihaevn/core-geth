@@ -20,9 +20,9 @@ import (
 	"bytes"
 	"context"
 	crand "crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"math/big"
 	"math/rand"
@@ -67,13 +67,13 @@ func (ethash *Ethash) makePoissonFakeDelay() float64 {
 
 // Seal implements consensus.Engine, attempting to find a nonce that satisfies
 // the block's difficulty requirements.
-func (ethash *Ethash) Seal(chain consensus.ChainHeaderReader, block *types.Block, results chan<- *types.Block, stop <-chan struct{}) error {
+func (ethash *Ethash) Seal(chain consensus.ChainHeaderReader, block *types.Block, results chan<- types.SealResult, stop <-chan struct{}) error {
 	// If we're running a fake PoW, simply return a 0 nonce immediately
 	if ethash.config.PowMode == ModeFake || ethash.config.PowMode == ModeFullFake {
 		header := block.Header()
 		header.Nonce, header.MixDigest = types.BlockNonce{}, common.Hash{}
 		select {
-		case results <- block.WithSeal(header):
+		case results <- types.SealResult{Block: block.WithSeal(header)}:
 		default:
 			ethash.config.Log.Warn("Sealing result is not read by miner", "mode", "fake", "sealhash", ethash.SealHash(block.Header()))
 		}
@@ -84,6 +84,7 @@ func (ethash *Ethash) Seal(chain consensus.ChainHeaderReader, block *types.Block
 			header.Nonce = types.EncodeNonce(uint64(rand.Int63n(math.MaxInt64)))
 			b, _ := header.Nonce.MarshalText()
 			header.MixDigest = common.BytesToHash(b)
+			var result *types.Block
 
 			// Wait some amount of time.
 			timeout := time.NewTimer(time.Duration(ethash.makePoissonFakeDelay()) * time.Second)
@@ -100,7 +101,7 @@ func (ethash *Ethash) Seal(chain consensus.ChainHeaderReader, block *types.Block
 			case <-timeout.C:
 				// Send the results when the timeout expires.
 				select {
-				case results <- block.WithSeal(header):
+				case results <- types.SealResult{Block: result}:
 				default:
 					ethash.config.Log.Warn("Sealing result is not read by miner", "mode", "fake", "sealhash", ethash.SealHash(block.Header()))
 				}
@@ -157,7 +158,7 @@ func (ethash *Ethash) Seal(chain consensus.ChainHeaderReader, block *types.Block
 		case result = <-locals:
 			// One of the threads found a block, abort all others
 			select {
-			case results <- result:
+			case results <- types.SealResult{Block: result}:
 			default:
 				ethash.config.Log.Warn("Sealing result is not read by miner", "mode", "local", "sealhash", ethash.SealHash(block.Header()))
 			}
@@ -238,6 +239,11 @@ search:
 // This is the timeout for HTTP requests to notify external miners.
 const remoteSealerTimeout = 1 * time.Second
 
+type submitBlockData struct {
+	Header   types.Header
+	SealHash common.Hash
+}
+
 type remoteSealer struct {
 	works        map[common.Hash]*types.Block
 	rates        map[common.Hash]hashrate
@@ -247,24 +253,24 @@ type remoteSealer struct {
 	cancelNotify context.CancelFunc // cancels all notification requests
 	reqWG        sync.WaitGroup     // tracks notification request goroutines
 
-	ethash       *Ethash
-	noverify     bool
-	notifyURLs   []string
-	results      chan<- *types.Block
-	workCh       chan *sealTask   // Notification channel to push new work and relative result channel to remote sealer
-	fetchWorkCh  chan *sealWork   // Channel used for remote sealer to fetch mining work
-	submitWorkCh chan *mineResult // Channel used for remote sealer to submit their mining result
-	rlpString    chan *string
-	fetchRateCh  chan chan uint64 // Channel used to gather submitted hash rate for local or remote sealer.
-	submitRateCh chan *hashrate   // Channel used for remote sealer to submit their mining hashrate
-	requestExit  chan struct{}
-	exitCh       chan struct{}
+	ethash        *Ethash
+	noverify      bool
+	notifyURLs    []string
+	results       chan<- types.SealResult
+	workCh        chan *sealTask   // Notification channel to push new work and relative result channel to remote sealer
+	fetchWorkCh   chan *sealWork   // Channel used for remote sealer to fetch mining work
+	submitWorkCh  chan *mineResult // Channel used for remote sealer to submit their mining result
+	submitBlockCh chan *submitBlockData
+	fetchRateCh   chan chan uint64 // Channel used to gather submitted hash rate for local or remote sealer.
+	submitRateCh  chan *hashrate   // Channel used for remote sealer to submit their mining hashrate
+	requestExit   chan struct{}
+	exitCh        chan struct{}
 }
 
 // sealTask wraps a seal block with relative result channel for remote sealer thread.
 type sealTask struct {
 	block   *types.Block
-	results chan<- *types.Block
+	results chan<- types.SealResult
 }
 
 // mineResult wraps the pow solution parameters for the specified block.
@@ -294,20 +300,21 @@ type sealWork struct {
 func startRemoteSealer(ethash *Ethash, urls []string, noverify bool) *remoteSealer {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &remoteSealer{
-		ethash:       ethash,
-		noverify:     noverify,
-		notifyURLs:   urls,
-		notifyCtx:    ctx,
-		cancelNotify: cancel,
-		works:        make(map[common.Hash]*types.Block),
-		rates:        make(map[common.Hash]hashrate),
-		workCh:       make(chan *sealTask),
-		fetchWorkCh:  make(chan *sealWork),
-		submitWorkCh: make(chan *mineResult),
-		fetchRateCh:  make(chan chan uint64),
-		submitRateCh: make(chan *hashrate),
-		requestExit:  make(chan struct{}),
-		exitCh:       make(chan struct{}),
+		ethash:        ethash,
+		noverify:      noverify,
+		notifyURLs:    urls,
+		notifyCtx:     ctx,
+		cancelNotify:  cancel,
+		works:         make(map[common.Hash]*types.Block),
+		rates:         make(map[common.Hash]hashrate),
+		workCh:        make(chan *sealTask),
+		fetchWorkCh:   make(chan *sealWork),
+		submitBlockCh: make(chan *submitBlockData),
+		submitWorkCh:  make(chan *mineResult),
+		fetchRateCh:   make(chan chan uint64),
+		submitRateCh:  make(chan *hashrate),
+		requestExit:   make(chan struct{}),
+		exitCh:        make(chan struct{}),
 	}
 	go s.loop()
 	return s
@@ -326,8 +333,8 @@ func (s *remoteSealer) loop() {
 
 	for {
 		select {
-		case rlp := <-s.rlpString:
-			s.ethash.remote.submitWorkByRlp(rlp)
+		case header := <-s.submitBlockCh:
+			s.submitWorkByRlp(&header.SealHash, &header.Header)
 
 		case work := <-s.workCh:
 			// Update current work with new received block.
@@ -412,31 +419,36 @@ func (s *remoteSealer) makeWork(block *types.Block) {
 	s.currentWork[7] = hexutil.EncodeUint64(uint64(len(block.Transactions())))
 	s.currentWork[8] = hexutil.EncodeUint64(uint64(len(block.Uncles())))
 
-	extra := append(header.Extra, make([]byte, 4)...)
-
-	enc := []interface{}{
-		header.ParentHash,
-		header.UncleHash,
-		header.Coinbase,
-		header.Root,
-		header.TxHash,
-		header.ReceiptHash,
-		header.Bloom,
-		header.Difficulty,
-		header.Number,
-		header.GasLimit,
-		header.GasUsed,
-		header.Time,
-		extra,
-	}
-	if header.BaseFee != nil {
-		enc = append(enc, header.BaseFee)
-	}
-
-	encoded, err := rlp.EncodeToBytes(enc)
+	encoded, err := rlp.EncodeToBytes(header)
 	if err == nil {
 		s.currentWork[9] = hexutil.Encode(encoded)
 	}
+	// extra := append(header.Extra, make([]byte, 4)...)
+
+	// enc := []interface{}{
+	// 	header.ParentHash,
+	// 	header.UncleHash,
+	// 	header.Coinbase,
+	// 	header.Root,
+	// 	header.TxHash,
+	// 	header.ReceiptHash,
+	// 	header.Bloom,
+	// 	header.Difficulty,
+	// 	header.Number,
+	// 	header.GasLimit,
+	// 	header.GasUsed,
+	// 	header.Time,
+	// 	extra,
+	// }
+	// if header.BaseFee != nil {
+	// 	enc = append(enc, header.BaseFee)
+	// }
+
+	// encoded, err := rlp.EncodeToBytes(enc)
+	// if err == nil {
+	// 	s.currentWork[9] = hexutil.Encode(encoded)
+	// }
+
 	// Trace the seal work fetched by remote sealer.
 	s.currentBlock = block
 	s.works[hash] = block
@@ -487,11 +499,9 @@ func (s *remoteSealer) sendNotification(ctx context.Context, url string, json []
 	}
 }
 
-func (s *remoteSealer) submitWorkByRlp(headerString *string) bool {
-	headerRlp, _ := hex.DecodeString(*headerString)
-	var header *types.Header
-	rlp.DecodeBytes([]byte(headerRlp), &header)
+func (s *remoteSealer) submitWorkByRlp(sealHash *common.Hash, header *types.Header) bool {
 
+	fmt.Printf("submit rlp to header: %v", header)
 	// Verify the correctness of submitted result.
 	// header := block.Header()
 	// header.Nonce = nonce
@@ -518,7 +528,7 @@ func (s *remoteSealer) submitWorkByRlp(headerString *string) bool {
 	// The submitted solution is within the scope of acceptance.
 	if solution.NumberU64()+staleThreshold > s.currentBlock.NumberU64() {
 		select {
-		case s.results <- solution:
+		case s.results <- types.SealResult{Block: solution, SealHash: sealHash}:
 			// s.ethash.config.Log.Debug("Work submitted is acceptable", "number", solution.NumberU64(), "sealhash", sealhash, "hash", solution.Hash())
 			return true
 		default:
@@ -566,11 +576,15 @@ func (s *remoteSealer) submitWork(nonce types.BlockNonce, mixDigest common.Hash,
 
 	// Solutions seems to be valid, return to the miner and notify acceptance.
 	solution := block.WithSeal(header)
+	result := types.SealResult{
+		Block:    solution,
+		SealHash: &sealhash,
+	}
 
 	// The submitted solution is within the scope of acceptance.
 	if solution.NumberU64()+staleThreshold > s.currentBlock.NumberU64() {
 		select {
-		case s.results <- solution:
+		case s.results <- result:
 			s.ethash.config.Log.Debug("Work submitted is acceptable", "number", solution.NumberU64(), "sealhash", sealhash, "hash", solution.Hash())
 			return true
 		default:
